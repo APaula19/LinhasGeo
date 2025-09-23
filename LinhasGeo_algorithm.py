@@ -26,8 +26,6 @@ __author__ = 'Ana Paula Pires dos Santos, Paulo Melo Coutinho Neves, Gabriella B
 __date__ = '2025-07-10'
 __copyright__ = '(C) 2025 by Ana Paula Pires dos Santos, Paulo Melo Coutinho Neves, Gabriella Bezerra Vale'
 
-# This will get replaced with a git SHA1 when you do a git archive
-
 __revision__ = '$Format:%H$'
 
 from qgis.core import (
@@ -35,6 +33,8 @@ from qgis.core import (
     QgsProcessingParameterEnum,
     QgsProcessingParameterFile,
     QgsProcessingParameterFeatureSink,
+    QgsProcessingParameterNumber,
+    QgsProcessingException,
     QgsFeature,
     QgsFields,
     QgsWkbTypes,
@@ -49,6 +49,30 @@ from pyproj import Geod
 import csv
 import pandas as pd
 
+def split_on_dateline(points):
+    """
+    Recebe lista de QgsPointXY e divide em múltiplas linhas
+    caso atravesse o meridiano de 180°.
+    """
+    if not points:
+        return []
+
+    parts = []
+    current_part = [points[0]]
+
+    for i in range(1, len(points)):
+        prev = points[i-1]
+        curr = points[i]
+        if abs(curr.x() - prev.x()) > 180:
+            parts.append(current_part)
+            current_part = [curr]
+        else:
+            current_part.append(curr)
+
+    parts.append(current_part)
+    return parts
+
+
 class LinhasGeoIMEAlgorithm(QgsProcessingAlgorithm):
     """
     Algoritmo que permite o usuário importar um .xls, escolher o método e
@@ -57,6 +81,44 @@ class LinhasGeoIMEAlgorithm(QgsProcessingAlgorithm):
 
     def tr(self, text):
         return QCoreApplication.translate('Processing', text)
+    
+    def shortHelpString(self):
+        return self.tr(
+            """
+            <h3> Plugin de Linhas Geodésicas</h3>
+            <p>Esse plugin gera linhas geodésicas entre pontos a partir de um arquivo <b>CSV</b> ou de <b>entradas manuais</b> pelo métodos 
+            <b>Inverso</b> (lat1, lon1, lat2, lon2) e <b>Direto</b> (lat1, lon1, azi1, dist). Suporta os métodos:
+            <b>Karney/WGS84</b>, <b>Vincenty/WGS84</b> e <b>Bessel (GeographicLib)</b>.</p>
+
+            <h4>Como usar</h4>
+            <ol>
+            <li>Selecione o <b>método desejado</b> (Inverso ou Direto).</li>
+            <li>Escolha o <b>Método Geodésico</b> para o cálculo.</li>
+            <li>Forneça <b>exatamente uma</b> fonte de dados:
+                <ul>
+                    <li><b>CSV (opcional)</b>: um arquivo com as colunas (aceita vírgula):<br/>
+                        - Inverso: <code>lat1, lon1, lat2, lon2</code> (também aceitos: <code>lat inicial, long inicial, lat final, long final</code>)<br/>
+                        - Direto: <code>lat1, lon1, azi1, dist</code> (também aceitos: <code>lat inicial, long inicial, azimute, distancia (km)</code>)
+                    </li>
+                    <li><b>Entradas manuais (opcionais)</b>: preencha apenas os campos correspondentes ao tipo escolhido.</li>
+                </ul>
+            </li>
+            <li>Defina a saída <b>Linhas geodésicas</b>.</li>
+            </ol>
+
+            <h4>Validações</h4>
+            <ul>
+            <li>Entrada obrigatória: CSV <i>ou</i> campos manuais (não ambos).</li>
+            <li>Tipos numéricos: valores não numéricos (p.ex. datas em &quot;azi1&quot;) são rejeitados com mensagem.</li>
+            <li>Faixas: <code>lat ∈ [-90, 90]</code>, <code>lon ∈ [-180, 180]</code>, <code>dist ≥ 0</code>. <code>azi1</code> é normalizado para <code>[0, 360)</code>.</li>
+            <li>Vincenty: se os pares antípodas não convergem; o algoritmo solicita usar Karney/WGS84.</li>
+            </ul>
+
+            <h4>Campos de saída</h4>
+            <p>Camada de </b>linhas</b> em EPSG:4326, com amostragem de ~1 ponto/km (mínimo 10 pontos por linha).</p>
+            """
+        )
+
 
     def createInstance(self):
         return LinhasGeoIMEAlgorithm()
@@ -89,7 +151,24 @@ class LinhasGeoIMEAlgorithm(QgsProcessingAlgorithm):
         self.addParameter(QgsProcessingParameterFile(
             'INPUT_CSV',
             self.tr('Arquivo CSV'),
-            extension='csv'))
+            extension='csv',
+            optional=True))
+        # Inverso
+        self.addParameter(QgsProcessingParameterNumber(
+            'LAT1', self.tr('Latitude inicial'), type=QgsProcessingParameterNumber.Double, optional=True))
+        self.addParameter(QgsProcessingParameterNumber(
+            'LON1', self.tr('Longitude inicial'), type=QgsProcessingParameterNumber.Double, optional=True))
+        self.addParameter(QgsProcessingParameterNumber(
+            'LAT2', self.tr('Latitude final'), type=QgsProcessingParameterNumber.Double, optional=True))
+        self.addParameter(QgsProcessingParameterNumber(
+            'LON2', self.tr('Longitude final'), type=QgsProcessingParameterNumber.Double, optional=True))
+
+        # Direto
+        self.addParameter(QgsProcessingParameterNumber(
+            'AZI1', self.tr('Azimute inicial (graus)'), type=QgsProcessingParameterNumber.Double, optional=True))
+        self.addParameter(QgsProcessingParameterNumber(
+            'DIST', self.tr('Distância (km)'), type=QgsProcessingParameterNumber.Double, optional=True))
+
 
         # 4. Saída
         self.addParameter(QgsProcessingParameterFeatureSink(
@@ -100,6 +179,35 @@ class LinhasGeoIMEAlgorithm(QgsProcessingAlgorithm):
         problem_type = self.parameterAsEnum(parameters, 'PROBLEM_TYPE', context)
         method = self.parameterAsEnum(parameters, 'METHOD', context)
         csv_path = self.parameterAsFile(parameters, 'INPUT_CSV', context)
+        
+        lat1 = self.parameterAsDouble(parameters, 'LAT1', context)
+        lon1 = self.parameterAsDouble(parameters, 'LON1', context)
+        lat2 = self.parameterAsDouble(parameters, 'LAT2', context)
+        lon2 = self.parameterAsDouble(parameters, 'LON2', context)
+        azi1 = self.parameterAsDouble(parameters, 'AZI1', context)
+        dist = self.parameterAsDouble(parameters, 'DIST', context)
+        
+        if not csv_path:
+            csv_path = None
+            
+        if not csv_path and all(v is None for v in [lat1, lon1, lat2, lon2, azi1, dist]):
+            raise QgsProcessingException(
+                self.tr("Você precisa fornecer um CSV ou preencher os parâmetros do problema (Direto ou Inverso).")
+            )
+
+        if not csv_path:
+            if problem_type == 0:  # Inverso
+                if None in [lat1, lon1, lat2, lon2]:
+                    raise QgsProcessingException(
+                        self.tr("Para o problema inverso, preencha LAT1, LON1, LAT2 e LON2 ou forneça um CSV.")
+                    )
+                
+            else:  # Direto
+                if None in [lat1, lon1, azi1, dist]:
+                    raise QgsProcessingException(
+                        self.tr("Para o problema direto, preencha LAT1, LON1, AZI1 e DIST ou forneça um CSV.")
+                    )
+                    
 
         # Configurar saída
         fields = QgsFields()
@@ -108,116 +216,134 @@ class LinhasGeoIMEAlgorithm(QgsProcessingAlgorithm):
             fields, QgsWkbTypes.LineString,
             QgsCoordinateReferenceSystem('EPSG:4326'))
         
-                
-        # Configurar o elipsoide conforme o método selecionado
-        if method == 0:  # Karney/WGS84
+        if method == 0:  # Karney
             geod = Geodesic.WGS84
-            method_name = "Karney/WGS84"
+            
+            if csv_path:
 
-            with open(csv_path, 'r') as f:
-                reader = csv.DictReader(f)
-                
-                for row in reader:
-                    points = []
+                with open(csv_path, 'r') as f:
+                    reader = csv.DictReader(f)
                     
-                    if problem_type == 0:  # Problema Inverso
-                        try:
-                            if method == 2:  
+                    for row in reader:
+                        points = []
+                        
+                        if problem_type == 0:  # Problema Inverso
+                            try:
                                 lat1 = float(row.get('lat inicial', row.get('lat1')))
                                 lon1 = float(row.get('long inicial', row.get('lon1')))
                                 lat2 = float(row.get('lat final', row.get('lat2')))
                                 lon2 = float(row.get('long final', row.get('lon2')))
-                            else:
-                                lat1 = float(row['lat1'])
-                                lon1 = float(row['lon1'])
-                                lat2 = float(row['lat2'])
-                                lon2 = float(row['lon2'])
-                            
-                            # Calcular linha geodésica
-                            inv = geod.Inverse(lat1, lon1, lat2, lon2)
-                            line = geod.Line(lat1, lon1, inv['azi1'])
-                            points.append(QgsPointXY(lon1, lat1))
-                            
-                            # Adiciona pontos intermediários para uma linha mais suave
-                            total_dist = inv['s12']
-                            steps = max(10, int(total_dist / 1000))  # Pelo menos 10 pontos ou 1 ponto por km
-                            
-                            for i in range(1, steps + 1):
-                                dist = (i / steps) * total_dist
-                                pos = line.Position(dist)
-                                points.append(QgsPointXY(pos['lon2'], pos['lat2']))
+                                
+                                inv = geod.Inverse(lat1, lon1, lat2, lon2)
+                                line = geod.Line(lat1, lon1, inv['azi1'])
+                                points.append(QgsPointXY(lon1, lat1))
+                                
+                                total_dist = inv['s12']
+                                steps = max(10, int(total_dist / 1000))
+                                
+                                for i in range(1, steps + 1):
+                                    dist = (i / steps) * total_dist
+                                    pos = line.Position(dist)
+                                    points.append(QgsPointXY(pos['lon2'], pos['lat2']))
 
-                        except (KeyError, ValueError) as e:
-                            feedback.reportError(f"Erro no problema inverso: {str(e)}")
-                            continue
+                            except Exception as e:
+                                feedback.reportError(f"Erro no problema inverso: {str(e)}")
+                                continue
 
-                    else:  # Problema Direto
-                        try:
-                            if method == 2:
+                        else:  # Problema Direto
+                            try:
                                 lat1 = float(row.get('lat inicial', row.get('lat1')))
                                 lon1 = float(row.get('long inicial', row.get('lon1')))
                                 azi1 = float(row.get('azimute', row.get('azi1')))
                                 dist_km = float(row.get('distancia (km)', row.get('dist')))
-                            else:
-                                lat1 = float(row['lat1'])
-                                lon1 = float(row['lon1'])
-                                azi1 = float(row['azi1'])
-                                dist_km = float(row['dist'])
-                            
-                            # Gerar linha com pontos intermediários
-                            points.append(QgsPointXY(lon1, lat1))
-                            line = geod.Line(lat1, lon1, azi1)
-                            total_dist = dist_km * 1000
-                            steps = max(10, int(dist_km))  # Pelo menos 10 pontos ou 1 ponto por km
-                            
-                            for i in range(1, steps + 1):
-                                dist = (i / steps) * total_dist
-                                pos = line.Position(dist)
-                                points.append(QgsPointXY(pos['lon2'], pos['lat2']))
+                                
+                                points.append(QgsPointXY(lon1, lat1))
+                                line = geod.Line(lat1, lon1, azi1)
+                                total_dist = dist_km * 1000
+                                steps = max(10, int(dist_km))
+                                
+                                for i in range(1, steps + 1):
+                                    dist = (i / steps) * total_dist
+                                    pos = line.Position(dist)
+                                    points.append(QgsPointXY(pos['lon2'], pos['lat2']))
 
-                        except (KeyError, ValueError) as e:
-                            feedback.reportError(f"Erro no problema direto: {str(e)}")
-                            continue
+                            except Exception as e:
+                                feedback.reportError(f"Erro no problema direto: {str(e)}")
+                                continue
 
-                    # Adicionar feature (para ambos os tipos)
-                    feat = QgsFeature()
-                    feat.setGeometry(QgsGeometry.fromPolylineXY(points))
+                        parts = split_on_dateline(points)
+                        feat = QgsFeature()
+                        if len(parts) == 1:
+                            feat.setGeometry(QgsGeometry.fromPolylineXY(parts[0]))
+                        else:
+                            feat.setGeometry(QgsGeometry.fromMultiPolylineXY(parts))
+                        sink.addFeature(feat)
+
+            else:
+                points = [QgsPointXY(lon1, lat1)]
+
+                if problem_type == 0:  # Inverso
+                    inv = geod.Inverse(lat1, lon1, lat2, lon2)
+                    line = geod.Line(lat1, lon1, inv['azi1'])
+                    total_dist = inv['s12']
+                    steps = max(10, int(total_dist / 1000))
+                    for i in range(1, steps + 1):
+                        dist_step = (i / steps) * total_dist
+                        pos = line.Position(dist_step)
+                        points.append(QgsPointXY(pos['lon2'], pos['lat2']))
+
+                else:  # Direto
+                    line = geod.Line(lat1, lon1, azi1)
+                    total_dist = dist * 1000
+                    steps = max(10, int(dist))
+                    for i in range(1, steps + 1):
+                        dist_step = (i / steps) * total_dist
+                        pos = line.Position(dist_step)
+                        points.append(QgsPointXY(pos['lon2'], pos['lat2']))
+
+                parts = split_on_dateline(points)
+                feat = QgsFeature()
+                if len(parts) == 1:
+                    feat.setGeometry(QgsGeometry.fromPolylineXY(parts[0]))
+                else:
+                    feat.setGeometry(QgsGeometry.fromMultiPolylineXY(parts))
+                sink.addFeature(feat)
+
+        elif method == 1:  # Vincenty
+            if csv_path:
+                features = self.calcular_com_vincenty_csv(csv_path, 
+                                                'Inverso' if problem_type == 0 else 'Direto', 
+                                                feedback)
+            else:
+                 features = self.calcular_com_vincenty(lat1, lon1, lat2, lon2, azi1, dist, problem_type, feedback)
+                
+            for feat in features:
                     sink.addFeature(feat)
-        elif method == 1:  # Vincenty/WGS84
-            features = self.calcular_com_vincenty(csv_path, 
-                                              'Inverso' if problem_type == 0 else 'Direto', 
-                                              feedback)
-            for feat in features:
-                sink.addFeature(feat)
         else:  # Bessel
-            features = self.calcular_com_bessel(csv_path, 
-                                            'Inverso' if problem_type == 0 else 'Direto', 
-                                            feedback)
+            if csv_path:
+                features = self.calcular_com_bessel_csv(csv_path, 
+                                                'Inverso' if problem_type == 0 else 'Direto', 
+                                                feedback)
+            else:
+                 features = self.calcular_com_bessel(lat1, lon1, lat2, lon2, azi1, dist, problem_type, feedback)
+                
             for feat in features:
                 sink.addFeature(feat)
-
 
         return {'OUTPUT': dest_id}
 
-    def calcular_com_vincenty(self, caminho_arquivo, metodo, feedback):
-        """
-        Função adaptada para usar com QGIS e plotar linhas geodésicas
-        """
+    
+    def calcular_com_vincenty_csv(self, caminho_arquivo, metodo, feedback):
         df = pd.read_csv(caminho_arquivo)
         geod = Geodesic.WGS84
         features = []
-        
+
         def pontos_antipodais(lat1, lon1, lat2, lon2, tol=1e-5):
-
-            # mesma latitude com sinal trocado
             cond_lat = abs(lat1 + lat2) < tol  
-
-            # diferença de longitude próxima de 180° (ou 0/360)
             dlon = abs((lon1 - lon2 + 180) % 360 - 180)
             cond_lon = abs(dlon - 180) < tol  
-
             return cond_lat and cond_lon
-
+        
         if metodo == 'Inverso':
             for _, row in df.iterrows():
                 try:
@@ -225,17 +351,16 @@ class LinhasGeoIMEAlgorithm(QgsProcessingAlgorithm):
                     
                     if pontos_antipodais(lat1, lon1, lat2, lon2):
                         feedback.reportError(
-                            f"Pontos ({lat1}, {lon1}) e ({lat2}, {lon2}) são/aproximam-se de antípodas. "
-                            "O método de Vincenty não converge nesse caso. Recomenda-se usar o método de Karney."
+                            f"Pontos ({lat1}, {lon1}) e ({lat2}, {lon2}) são antípodas. "
+                            "O método de Vincenty não converge nesse caso. Use Karney."
                         )
                         continue
                     
                     inv = geod.Inverse(lat1, lon1, lat2, lon2)
                     line = geod.Line(lat1, lon1, inv['azi1'])
                     
-                    points1 = [QgsPointXY(lon1, lat1)]
-                    points2 = [QgsPointXY(lon2, lat2)]
-                    total_dist = vincenty(points1, points2, ellipsoid='WGS-84').meters
+                    points = [QgsPointXY(lon1, lat1)]
+                    total_dist = vincenty((lat1, lon1), (lat2, lon2), ellipsoid='WGS-84').meters
                     steps = max(10, int(total_dist / 1000))
                     
                     for i in range(1, steps + 1):
@@ -243,8 +368,12 @@ class LinhasGeoIMEAlgorithm(QgsProcessingAlgorithm):
                         pos = line.Position(dist)
                         points.append(QgsPointXY(pos['lon2'], pos['lat2']))
                     
+                    parts = split_on_dateline(points)
                     feat = QgsFeature()
-                    feat.setGeometry(QgsGeometry.fromPolylineXY(points))
+                    if len(parts) == 1:
+                        feat.setGeometry(QgsGeometry.fromPolylineXY(parts[0]))
+                    else:
+                        feat.setGeometry(QgsGeometry.fromMultiPolylineXY(parts))
                     features.append(feat)
                 except Exception as e:
                     feedback.reportError(f"Erro Vincenty Inverso: {str(e)}")
@@ -264,8 +393,12 @@ class LinhasGeoIMEAlgorithm(QgsProcessingAlgorithm):
                         pos = line.Position(dist_step)
                         points.append(QgsPointXY(pos['lon2'], pos['lat2']))
                     
+                    parts = split_on_dateline(points)
                     feat = QgsFeature()
-                    feat.setGeometry(QgsGeometry.fromPolylineXY(points))
+                    if len(parts) == 1:
+                        feat.setGeometry(QgsGeometry.fromPolylineXY(parts[0]))
+                    else:
+                        feat.setGeometry(QgsGeometry.fromMultiPolylineXY(parts))
                     features.append(feat)
                 except Exception as e:
                     feedback.reportError(f"Erro Vincenty Direto: {str(e)}")
@@ -273,10 +406,7 @@ class LinhasGeoIMEAlgorithm(QgsProcessingAlgorithm):
 
         return features
 
-    def calcular_com_bessel(self, caminho_arquivo, metodo, feedback):
-        """
-        Função adaptada para usar com QGIS e plotar linhas geodésicas
-        """
+    def calcular_com_bessel_csv(self, caminho_arquivo, metodo, feedback):
         df = pd.read_csv(caminho_arquivo)
         geod = Geodesic(6377397.155, 1/299.1528128)
         features = []
@@ -302,15 +432,19 @@ class LinhasGeoIMEAlgorithm(QgsProcessingAlgorithm):
                         pos = line.Position(dist_step)
                         points.append(QgsPointXY(pos['lon2'], pos['lat2']))
                     
+                    parts = split_on_dateline(points)
                     feat = QgsFeature()
-                    feat.setGeometry(QgsGeometry.fromPolylineXY(points))
+                    if len(parts) == 1:
+                        feat.setGeometry(QgsGeometry.fromPolylineXY(parts[0]))
+                    else:
+                        feat.setGeometry(QgsGeometry.fromMultiPolylineXY(parts))
                     features.append(feat)
                 
                 elif pd.notna(lat1) and pd.notna(lon1) and pd.notna(lat2) and pd.notna(lon2):
                     # Problema Inverso
                     inv = geod.Inverse(lat1, lon1, lat2, lon2)
                     line = geod.Line(lat1, lon1, inv['azi1'])
-                    total_dist = geod.inv(lon1, lat1, lon2, lat2)
+                    total_dist = inv['s12']
                     steps = max(10, int(total_dist / 1000))
                     
                     points = [QgsPointXY(lon1, lat1)]
@@ -319,12 +453,87 @@ class LinhasGeoIMEAlgorithm(QgsProcessingAlgorithm):
                         pos = line.Position(dist_step)
                         points.append(QgsPointXY(pos['lon2'], pos['lat2']))
                     
+                    parts = split_on_dateline(points)
                     feat = QgsFeature()
-                    feat.setGeometry(QgsGeometry.fromPolylineXY(points))
+                    if len(parts) == 1:
+                        feat.setGeometry(QgsGeometry.fromPolylineXY(parts[0]))
+                    else:
+                        feat.setGeometry(QgsGeometry.fromMultiPolylineXY(parts))
                     features.append(feat)
                 
             except Exception as e:
                 feedback.reportError(f"Erro Bessel: {str(e)}")
                 continue
 
+        return features
+
+    def calcular_com_vincenty(self, lat1, lon1, lat2, lon2, azi1, dist, problem_type, feedback):
+        geod = Geodesic.WGS84
+        features = []
+        points = [QgsPointXY(lon1, lat1)]
+        
+        def pontos_antipodais(lat1, lon1, lat2, lon2, tol=1e-5):
+            cond_lat = abs(lat1 + lat2) < tol  
+            dlon = abs((lon1 - lon2 + 180) % 360 - 180)
+            cond_lon = abs(dlon - 180) < tol  
+            return cond_lat and cond_lon
+
+        if problem_type == 0:  # Inverso
+            try:                
+                if pontos_antipodais(lat1, lon1, lat2, lon2):
+                    feedback.reportError(
+                        f"Pontos ({lat1}, {lon1}) e ({lat2}, {lon2}) são antípodas. "
+                        "O método de Vincenty não converge nesse caso. Use Karney."
+                    )
+                inv = geod.Inverse(lat1, lon1, lat2, lon2)
+                line = geod.Line(lat1, lon1, inv['azi1'])
+                total_dist = vincenty((lat1, lon1), (lat2, lon2), ellipsoid='WGS-84').meters
+                steps = max(10, int(total_dist / 1000))
+                for i in range(1, steps + 1):
+                    dist_step = (i / steps) * total_dist
+                    pos = line.Position(dist_step)
+                    points.append(QgsPointXY(pos['lon2'], pos['lat2']))
+                    
+            except Exception as e:
+                    feedback.reportError(f"Erro Vincenty Inverso: {str(e)}")
+        else:  # Direto
+            line = geod.Line(lat1, lon1, azi1)
+            total_dist = dist * 1000
+            steps = max(10, int(dist))
+            for i in range(1, steps + 1):
+                dist_step = (i / steps) * total_dist
+                pos = line.Position(dist_step)
+                points.append(QgsPointXY(pos['lon2'], pos['lat2']))
+
+        feat = QgsFeature()
+        feat.setGeometry(QgsGeometry.fromPolylineXY(points))
+        features.append(feat)
+        return features
+    
+    def calcular_com_bessel(self, lat1, lon1, lat2, lon2, azi1, dist, problem_type, feedback):
+        geod = Geodesic(6377397.155, 1/299.1528128)
+        features = []
+        points = [QgsPointXY(lon1, lat1)]
+
+        if problem_type == 0:  # Inverso
+            inv = geod.Inverse(lat1, lon1, lat2, lon2)
+            line = geod.Line(lat1, lon1, inv['azi1'])
+            total_dist = inv['s12']
+            steps = max(10, int(total_dist / 1000))
+            for i in range(1, steps + 1):
+                dist_step = (i / steps) * total_dist
+                pos = line.Position(dist_step)
+                points.append(QgsPointXY(pos['lon2'], pos['lat2']))
+        else:  # Direto
+            line = geod.Line(lat1, lon1, azi1)
+            total_dist = dist * 1000
+            steps = max(10, int(dist))
+            for i in range(1, steps + 1):
+                dist_step = (i / steps) * total_dist
+                pos = line.Position(dist_step)
+                points.append(QgsPointXY(pos['lon2'], pos['lat2']))
+
+        feat = QgsFeature()
+        feat.setGeometry(QgsGeometry.fromPolylineXY(points))
+        features.append(feat)
         return features
