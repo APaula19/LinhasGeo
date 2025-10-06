@@ -88,7 +88,7 @@ class LinhasGeoIMEAlgorithm(QgsProcessingAlgorithm):
             <h3> Plugin de Linhas Geodésicas</h3>
             <p>Esse plugin gera linhas geodésicas entre pontos a partir de um arquivo <b>CSV</b> ou de <b>entradas manuais</b> pelo métodos 
             <b>Inverso</b> (lat1, lon1, lat2, lon2) e <b>Direto</b> (lat1, lon1, azi1, dist). Suporta os métodos:
-            <b>Karney/WGS84</b>, <b>Vincenty/WGS84</b> e <b>Bessel (GeographicLib)</b>.</p>
+            <b>Karney/WGS84 (Precisão ~1m)</b>, <b>Vincenty/WGS84 (Precisão ~0.5mm)</b> e <b>Bessel (Precisão <15nm)</b>.</p>
 
             <h4>Como usar</h4>
             <ol>
